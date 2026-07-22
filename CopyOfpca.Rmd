@@ -1,0 +1,651 @@
+---
+title: "PCA"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5,
+  out.width = "90%"
+)
+options(width = 80)
+```
+
+## Principal Component Analysis on Brazil Microregion Data
+
+This PCA uses selected socioeconomic, climatic, and environmental variables to characterize Brazilian microregions. Because the PCA variables include both `gdp` and `building_area`, the PCA should be interpreted as an **economic-environmental PCA**, not as a purely climate/environmental PCA.
+
+The highly correlated temperature variables `temp_min` and `temp_max` are excluded from the PCA because `temp_mean` already captures the main temperature gradient and because the three temperature variables are strongly collinear.
+
+Load required libraries.
+
+```{r}
+library(corrplot)
+library(PerformanceAnalytics)
+
+# Prevent rgl/X11 warnings when knitting on a server or Posit Cloud.
+options(rgl.useNULL = TRUE)
+library(heplots)
+```
+
+Load the prepared data.
+
+```{r}
+load("/cloud/project/data/prepared_data.RData")
+
+# Basic checks
+stopifnot(exists("df"))
+stopifnot(exists("num_vars"))
+
+# Keep a row identifier for tracing observations.
+df$.row_id <- seq_len(nrow(df))
+
+# Stable factor ordering for interpretation.
+if ("region" %in% names(df)) {
+  region_levels <- c(
+    "Centro-Oeste", "Nordeste", "Norte", "Sudeste", "Sul"
+  )
+  
+  if (all(region_levels %in% unique(df$region))) {
+    df$region <- factor(df$region, levels = region_levels)
+  } else {
+    df$region <- factor(df$region)
+  }
+}
+
+if ("gdp_group" %in% names(df)) {
+  df$gdp_group <- factor(
+    df$gdp_group,
+    levels = c("Low", "Medium", "High")
+  )
+}
+
+# Confirm numeric variables available for PCA-related inspection.
+num_vars
+```
+
+---
+
+## Step 1: Check Correlations Among All Numeric Variables
+
+Before running PCA, we examine whether variables are sufficiently correlated to justify dimension reduction. This correlation matrix includes all numeric variables in `num_vars`, including `temp_min` and `temp_max`, so that the temperature redundancy can be documented.
+
+```{r}
+# Correlation matrix using all numeric variables.
+cor_all <- cor(df[, num_vars], use = "pairwise.complete.obs")
+round(cor_all, 2)
+
+# Visual correlation plot ordered by hierarchical clustering.
+par(oma = c(0, 0, 2, 0), mar = c(1, 1, 1, 1))
+
+corrplot.mixed(
+  cor_all,
+  lower.col = "black",
+  upper = "ellipse",
+  tl.col = "black",
+  number.cex = 0.65,
+  order = "hclust",
+  tl.pos = "lt",
+  tl.cex = 0.7
+)
+
+title("Correlations for Variables", outer = TRUE)
+```
+
+---
+
+## Step 2: Check Linearity and Pairwise Structure
+
+```{r}
+chart.Correlation(df[, num_vars], histogram = TRUE, pch = 19)
+```
+
+---
+
+## Step 3: Define Final PCA Variable Set
+
+```{r}
+# Remove temp_min and temp_max from num_vars.
+# temp_mean, temp_min, and temp_max are highly correlated with one another.
+# Retaining all three adds redundancy without adding much independent information.
+num_vars2 <- num_vars[!num_vars %in% c("temp_min", "temp_max")]
+
+# Confirm final PCA variable set.
+num_vars2
+length(num_vars2)
+```
+
+Create the PCA dataset using complete cases.
+
+```{r}
+# Include metadata for plotting and interpretation.
+metadata_vars <- c(".row_id", "microregion_code", "region", "gdp_group")
+metadata_vars <- metadata_vars[metadata_vars %in% names(df)]
+
+pca_needed <- unique(c(metadata_vars, num_vars2))
+df_pca <- df[complete.cases(df[, num_vars2]), pca_needed]
+
+# Confirm dimensions and summaries.
+dim(df_pca)
+summary(df_pca[, num_vars2])
+
+if ("region" %in% names(df_pca)) {
+  table(df_pca$region)
+}
+
+if ("gdp_group" %in% names(df_pca)) {
+  table(df_pca$gdp_group)
+}
+```
+
+---
+
+## Step 4: Check Correlations in the Final PCA Variable Set
+
+```{r}
+cor_pca <- cor(df_pca[, num_vars2], use = "pairwise.complete.obs")
+round(cor_pca, 2)
+
+par(oma = c(0, 0, 2, 0), mar = c(1, 1, 1, 1))
+
+corrplot.mixed(
+  cor_pca,
+  lower.col = "black",
+  upper = "ellipse",
+  tl.col = "black",
+  number.cex = 0.7,
+  order = "hclust",
+  tl.pos = "lt",
+  tl.cex = 0.75
+)
+
+title("Correlations for Final PCA Variables", outer = TRUE)
+```
+
+---
+
+## Step 5: Check Multivariate Normality
+
+PCA does not require strict multivariate normality for descriptive dimension reduction, but this plot is useful for identifying departures from multivariate normality and potential outlying observations.
+
+```{r mvn-check, fig.width=7, fig.height=5, out.width="90%"}
+cqplot(
+  scale(df_pca[, num_vars2]),
+  main = "Multivariate Normality Check for Final PCA Variables"
+)
+```
+
+---
+
+## Step 6: Run PCA
+
+We use `prcomp()` with `center = TRUE` and `scale. = TRUE`, so all variables are standardized before PCA. This is necessary because the variables have different measurement units.
+
+```{r}
+# Custom summary function: shows eigenvalues instead of standard deviations.
+summary.PCA.JDRS <- function(x) {
+  sum_JDRS <- summary(x)$importance
+  sum_JDRS[1, ] <- sum_JDRS[1, ]^2
+  attr(sum_JDRS, "dimnames")[[1]][1] <- "Eigenvals (Variance)"
+  sum_JDRS
+}
+
+# Run PCA on standardized variables.
+pc1 <- prcomp(df_pca[, num_vars2], center = TRUE, scale. = TRUE)
+
+# Eigenvalues and proportion of variance explained.
+pca_summary <- round(summary.PCA.JDRS(pc1), 3)
+pca_summary
+
+# Loadings: variables driving each principal component.
+pca_loadings <- round(pc1$rotation, 3)
+pca_loadings
+```
+
+Create a clean PCA summary table.
+
+```{r}
+eigenvalues <- pc1$sdev^2
+prop_var <- eigenvalues / sum(eigenvalues)
+cum_var <- cumsum(prop_var)
+
+pca_table <- data.frame(
+  PC = paste0("PC", seq_along(eigenvalues)),
+  eigenvalue = eigenvalues,
+  proportion_variance = prop_var,
+  cumulative_variance = cum_var,
+  retain_kaiser = eigenvalues > 1
+)
+
+pca_table
+```
+
+---
+
+## Step 7: Identify Main Loadings for Each Principal Component
+
+```{r}
+get_top_loadings <- function(rotation_matrix, pcs = 1:4, top_n = 5) {
+  out <- lapply(pcs, function(pc_index) {
+    pc_name <- colnames(rotation_matrix)[pc_index]
+    loadings <- rotation_matrix[, pc_index]
+    top_vars <- names(sort(abs(loadings), decreasing = TRUE))[1:top_n]
+    
+    data.frame(
+      PC = pc_name,
+      variable = top_vars,
+      loading = loadings[top_vars],
+      abs_loading = abs(loadings[top_vars]),
+      row.names = NULL
+    )
+  })
+  
+  do.call(rbind, out)
+}
+
+top_loadings <- get_top_loadings(
+  pc1$rotation,
+  pcs = 1:min(4, ncol(pc1$rotation)),
+  top_n = 5
+)
+
+top_loadings
+```
+
+---
+
+## Step 8: Scree Plot
+
+```{r scree-plot, fig.width=7, fig.height=5, out.width="90%"}
+screeplot(
+  pc1,
+  type = "lines",
+  col = "red",
+  lwd = 2,
+  pch = 19,
+  cex = 1.2,
+  main = "Scree Plot - Economic-Environmental PCA"
+)
+
+abline(h = 1, lty = 2)
+```
+
+---
+
+## Step 9: Parallel Analysis / Threshold Plot
+
+This self-contained parallel analysis avoids relying on externally sourced functions. Random datasets are generated by independently permuting each variable, preserving each variable's marginal distribution while breaking cross-variable correlations. PCs with observed eigenvalues above the random threshold are candidates for retention.
+
+```{r parallel-analysis, fig.width=7, fig.height=5, out.width="90%"}
+parallel_pca_threshold <- function(
+  data,
+  n_iter = 500,
+  quantile_level = 0.95,
+  seed = 20260430
+) {
+  set.seed(seed)
+  
+  x <- as.data.frame(scale(data))
+  p <- ncol(x)
+  
+  observed_eigenvalues <- prcomp(
+    x,
+    center = FALSE,
+    scale. = FALSE
+  )$sdev^2
+  
+  random_eigenvalues <- matrix(
+    NA_real_,
+    nrow = n_iter,
+    ncol = p
+  )
+  
+  for (i in seq_len(n_iter)) {
+    random_x <- as.data.frame(lapply(x, sample, replace = FALSE))
+    random_eigenvalues[i, ] <- prcomp(
+      random_x,
+      center = FALSE,
+      scale. = FALSE
+    )$sdev^2
+  }
+  
+  random_mean <- apply(random_eigenvalues, 2, mean)
+  random_quantile <- apply(
+    random_eigenvalues,
+    2,
+    quantile,
+    probs = quantile_level
+  )
+  
+  out <- data.frame(
+    PC = paste0("PC", seq_len(p)),
+    observed_eigenvalue = observed_eigenvalues,
+    random_mean_eigenvalue = random_mean,
+    random_quantile_eigenvalue = random_quantile,
+    retain_mean_rule = observed_eigenvalues > random_mean,
+    retain_quantile_rule = observed_eigenvalues > random_quantile
+  )
+  
+  plot(
+    seq_len(p),
+    observed_eigenvalues,
+    type = "b",
+    pch = 19,
+    ylim = range(c(observed_eigenvalues, random_mean, random_quantile)),
+    xlab = "Principal Component",
+    ylab = "Eigenvalue",
+    main = "Parallel Analysis for PCA"
+  )
+  
+  lines(seq_len(p), random_mean, type = "b", pch = 17, lty = 2)
+  lines(seq_len(p), random_quantile, type = "b", pch = 15, lty = 3)
+  abline(h = 1, lty = 4)
+  
+  legend_labels <- c(
+    "Observed",
+    "Random mean",
+    paste0("Random ", quantile_level * 100, "%"),
+    "Kaiser = 1"
+  )
+  
+  legend(
+    "topright",
+    legend = legend_labels,
+    pch = c(19, 17, 15, NA),
+    lty = c(1, 2, 3, 4),
+    bty = "n"
+  )
+  
+  out
+}
+
+parallel_results <- parallel_pca_threshold(
+  df_pca[, num_vars2],
+  n_iter = 500,
+  quantile_level = 0.95,
+  seed = 20260430
+)
+
+parallel_results
+```
+
+---
+
+## Step 10: Score Plot for PC1 vs PC2
+
+```{r score-plot-ellipse, fig.width=7, fig.height=5, out.width="90%"}
+draw_score_ellipse <- function(
+  x,
+  y,
+  level = 0.95,
+  n = 200,
+  col = "red",
+  lwd = 2
+) {
+  ok <- is.finite(x) & is.finite(y)
+  xy <- cbind(x[ok], y[ok])
+  
+  mu <- colMeans(xy)
+  S <- cov(xy)
+  eig <- eigen(S)
+  
+  angles <- seq(0, 2 * pi, length.out = n)
+  circle <- rbind(cos(angles), sin(angles))
+  radius <- sqrt(qchisq(level, df = 2))
+  
+  ellipse <- t(
+    mu + radius *
+      eig$vectors %*%
+      diag(sqrt(eig$values)) %*%
+      circle
+  )
+  
+  lines(ellipse[, 1], ellipse[, 2], col = col, lwd = lwd)
+}
+
+pcx <- 1
+pcy <- 2
+
+xlab_pc <- paste0("PC", pcx, " (", round(100 * prop_var[pcx], 1), "%)")
+ylab_pc <- paste0("PC", pcy, " (", round(100 * prop_var[pcy], 1), "%)")
+
+plot(
+  pc1$x[, pcx],
+  pc1$x[, pcy],
+  pch = 19,
+  cex = 0.6,
+  col = "darkblue",
+  xlab = xlab_pc,
+  ylab = ylab_pc,
+  main = "PC1 vs PC2 Score Plot"
+)
+
+draw_score_ellipse(pc1$x[, pcx], pc1$x[, pcy], level = 0.95)
+
+# Label only the most extreme observations in PC1-PC2 space to avoid overplotting.
+score_dist <- rowSums(scale(pc1$x[, c(pcx, pcy)])^2)
+top_score_idx <- order(score_dist, decreasing = TRUE)[
+  1:min(10, length(score_dist))
+]
+
+if ("microregion_code" %in% names(df_pca)) {
+  text(
+    pc1$x[top_score_idx, pcx],
+    pc1$x[top_score_idx, pcy],
+    labels = df_pca$microregion_code[top_score_idx],
+    pos = 3,
+    cex = 0.6
+  )
+} else {
+  text(
+    pc1$x[top_score_idx, pcx],
+    pc1$x[top_score_idx, pcy],
+    labels = df_pca$.row_id[top_score_idx],
+    pos = 3,
+    cex = 0.6
+  )
+}
+```
+
+---
+
+## Step 11: Custom Biplot for PC1 vs PC2
+
+The standard base-R `biplot()` labels all observations and can become unreadable with 558 microregions. The custom biplot below shows observations as points and variables as loading arrows.
+
+```{r custom-biplot, fig.width=7, fig.height=5, out.width="90%"}
+custom_pca_biplot <- function(pc, choices = c(1, 2), prop_var) {
+  pcx <- choices[1]
+  pcy <- choices[2]
+  
+  scores_x <- pc$x[, pcx]
+  scores_y <- pc$x[, pcy]
+  loadings_x <- pc$rotation[, pcx]
+  loadings_y <- pc$rotation[, pcy]
+  
+  x_range <- diff(range(scores_x))
+  y_range <- diff(range(scores_y))
+  loading_x_range <- diff(range(loadings_x))
+  loading_y_range <- diff(range(loadings_y))
+  
+  scale_factor <- 0.35 * min(
+    x_range / loading_x_range,
+    y_range / loading_y_range
+  )
+  
+  arrow_x <- loadings_x * scale_factor
+  arrow_y <- loadings_y * scale_factor
+  
+  plot(
+    scores_x,
+    scores_y,
+    pch = 19,
+    cex = 0.45,
+    col = "gray60",
+    xlab = paste0("PC", pcx, " (", round(100 * prop_var[pcx], 1), "%)"),
+    ylab = paste0("PC", pcy, " (", round(100 * prop_var[pcy], 1), "%)"),
+    main = paste0("PCA Biplot: PC", pcx, " vs PC", pcy)
+  )
+  
+  abline(h = 0, v = 0, lty = 2, col = "gray40")
+  arrows(0, 0, arrow_x, arrow_y, length = 0.08, col = "red", lwd = 1.5)
+  
+  text(
+    arrow_x * 1.12,
+    arrow_y * 1.12,
+    labels = rownames(pc$rotation),
+    col = "red",
+    cex = 0.8
+  )
+}
+
+custom_pca_biplot(pc1, choices = c(1, 2), prop_var = prop_var)
+```
+
+---
+
+## Step 12: Score Plot Colored by Region
+
+```{r score-by-region, fig.width=7, fig.height=5, out.width="90%"}
+if ("region" %in% names(df_pca)) {
+  region_factor <- as.factor(df_pca$region)
+  
+  plot(
+    pc1$x[, 1],
+    pc1$x[, 2],
+    col = as.numeric(region_factor),
+    pch = 19,
+    cex = 0.7,
+    xlab = paste0("PC1 (", round(100 * prop_var[1], 1), "%)"),
+    ylab = paste0("PC2 (", round(100 * prop_var[2], 1), "%)"),
+    main = "PC1 vs PC2 Colored by Region"
+  )
+  
+  legend(
+    "bottomright",
+    legend = levels(region_factor),
+    col = seq_along(levels(region_factor)),
+    pch = 19,
+    cex = 0.8,
+    title = "Region"
+  )
+}
+```
+
+---
+
+## Step 13: Score Plot Colored by GDP Group
+
+```{r score-by-gdp-group, fig.width=7, fig.height=5, out.width="90%"}
+if ("gdp_group" %in% names(df_pca)) {
+  gdp_factor <- as.factor(df_pca$gdp_group)
+  
+  plot(
+    pc1$x[, 1],
+    pc1$x[, 2],
+    col = as.numeric(gdp_factor),
+    pch = 19,
+    cex = 0.7,
+    xlab = paste0("PC1 (", round(100 * prop_var[1], 1), "%)"),
+    ylab = paste0("PC2 (", round(100 * prop_var[2], 1), "%)"),
+    main = "PC1 vs PC2 Colored by GDP Group"
+  )
+  
+  legend(
+    "bottomright",
+    legend = levels(gdp_factor),
+    col = seq_along(levels(gdp_factor)),
+    pch = 19,
+    cex = 0.8,
+    title = "GDP Group"
+  )
+}
+```
+
+---
+
+## Step 14: PCA Scores and Loadings for Reporting
+
+```{r}
+pca_scores <- as.data.frame(pc1$x)
+pca_scores$.row_id <- df_pca$.row_id
+
+if ("microregion_code" %in% names(df_pca)) {
+  pca_scores$microregion_code <- df_pca$microregion_code
+}
+
+if ("region" %in% names(df_pca)) {
+  pca_scores$region <- df_pca$region
+}
+
+if ("gdp_group" %in% names(df_pca)) {
+  pca_scores$gdp_group <- df_pca$gdp_group
+}
+
+metadata_cols <- intersect(
+  c(".row_id", "microregion_code", "region", "gdp_group"),
+  names(pca_scores)
+)
+
+pc_cols <- paste0("PC", seq_len(ncol(pc1$x)))
+pca_scores <- pca_scores[, c(metadata_cols, pc_cols)]
+
+# Print a compact score table for reporting.
+pca_scores_compact <- pca_scores[
+  ,
+  c(metadata_cols, paste0("PC", 1:4))
+]
+
+head(pca_scores_compact)
+
+pca_loadings_table <- data.frame(
+  variable = rownames(pc1$rotation),
+  pc1$rotation,
+  row.names = NULL
+)
+
+# Print PC1-PC4 loadings, which are the retained components.
+pca_loadings_pc1_pc4 <- pca_loadings_table[
+  ,
+  c("variable", paste0("PC", 1:4))
+]
+
+pca_loadings_pc1_pc4
+```
+
+---
+
+## Final Summary
+
+```{r}
+cat("Final PCA variables:\n")
+print(num_vars2)
+
+cat("\nNumber of observations used in PCA:", nrow(df_pca), "\n")
+cat("Number of variables used in PCA:", length(num_vars2), "\n")
+
+cat("\nVariance explained by PC1:", round(100 * prop_var[1], 2), "%\n")
+cat("Variance explained by PC2:", round(100 * prop_var[2], 2), "%\n")
+
+pc12_text <- round(100 * cum_var[2], 2)
+pc14_text <- round(100 * cum_var[min(4, length(cum_var))], 2)
+
+cat("Cumulative variance explained by PC1-PC2:", pc12_text, "%\n")
+cat("Cumulative variance explained by PC1-PC4:", pc14_text, "%\n")
+
+n_kaiser <- sum(eigenvalues > 1)
+cat("\nNumber of PCs retained by Kaiser criterion eigenvalue > 1:", n_kaiser, "\n")
+
+cat("\nTop loadings for first four PCs:\n")
+print(top_loadings)
+
+cat("\nParallel analysis retention table:\n")
+print(parallel_results)
+```

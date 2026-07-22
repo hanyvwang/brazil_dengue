@@ -1,0 +1,532 @@
+---
+title: "GLM"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generalized Linear Models on Brazil Microregion Data
+
+We fit two models:
+
+1. **Linear regression / Gaussian GLM** - predict continuous `log_gdp` from the selected socioeconomic, climate, and environmental predictors.
+2. **Multinomial logistic regression** - predict three-level `gdp_group` (`Low`, `Medium`, `High`) using `Low` as the reference category. This allows direct interpretation of `Medium vs Low` and `High vs Low`.
+
+Important modeling choice: for the multinomial logistic regression, all predictors are standardized before fitting the model. This avoids numerical instability from variables with very different units and makes the coefficients interpretable as effects per 1-standard-deviation increase.
+
+Load required libraries.
+
+```{r}
+library(car)
+library(MASS)
+library(nnet)
+```
+
+Load the prepared data and define the selected predictors.
+
+```{r}
+load("/cloud/project/data/prepared_data.RData")
+
+# Basic checks
+stopifnot(exists("df"))
+stopifnot(exists("num_vars"))
+
+# Keep an explicit row ID so observations can be traced back if needed.
+df$.row_id <- seq_len(nrow(df))
+
+# Predictors: keep the selected numeric variables, but exclude gdp itself
+# because gdp is the response in the linear model and the source of gdp_group.
+predictors <- setdiff(num_vars, "gdp")
+predictors <- predictors[predictors %in% names(df)]
+
+# Set GDP group order. Low is the reference group for the multinomial model.
+df$gdp_group <- factor(df$gdp_group, levels = c("Low", "Medium", "High"))
+
+# Check that GDP is positive before log transformation.
+if (any(df$gdp <= 0, na.rm = TRUE)) {
+  stop("GDP contains zero or negative values, so log(GDP) cannot be computed safely.")
+}
+
+# Add log-transformed GDP.
+df$log_gdp <- log(df$gdp)
+
+# Keep complete cases for the variables used in this GLM analysis.
+glm_vars <- c("gdp", "log_gdp", "gdp_group", predictors)
+df_glm <- df[complete.cases(df[, glm_vars]), c(".row_id", glm_vars)]
+
+# Confirm variables and group sizes.
+predictors
+table(df_glm$gdp_group)
+summary(df_glm[, predictors])
+```
+
+---
+
+## Part 1: Linear Regression / Gaussian GLM - Predicting log(GDP)
+
+### Step 1: Explore the Response Variable
+
+```{r}
+hist(df_glm$gdp, col = "lightblue", breaks = 30,
+     main = "Distribution of GDP", xlab = "GDP")
+
+boxplot(df_glm$gdp, col = "lightblue", main = "Boxplot of GDP")
+
+hist(df_glm$log_gdp, col = "lightblue", breaks = 30,
+     main = "Distribution of log(GDP)", xlab = "log(GDP)")
+
+boxplot(df_glm$log_gdp, col = "lightblue", main = "Boxplot of log(GDP)")
+```
+
+### Step 2: Check Relationships Between Predictors and log(GDP)
+
+```{r}
+ncols <- 3
+nrows <- ceiling(length(predictors) / ncols)
+old_par <- par(mfrow = c(nrows, ncols), mar = c(4, 4, 2, 1))
+
+for (v in predictors) {
+  plot(df_glm[[v]], df_glm$log_gdp,
+       pch = 19, cex = 0.5, col = "darkblue",
+       xlab = v, ylab = "log(GDP)",
+       main = paste("log(GDP) vs", v))
+  abline(lm(df_glm$log_gdp ~ df_glm[[v]]), col = "red", lwd = 2)
+}
+
+par(old_par)
+```
+
+### Step 3: Fit Full Linear Model
+
+```{r}
+linear_formula <- as.formula(
+  paste("log_gdp ~", paste(predictors, collapse = " + "))
+)
+
+glm_linear <- lm(linear_formula, data = df_glm)
+
+summary(glm_linear)
+```
+
+### Step 4: Type III Anova Table for Full Linear Model
+
+```{r}
+old_options <- options(contrasts = c("contr.sum", "contr.poly"))
+Anova(glm_linear, type = 3)
+options(old_options)
+```
+
+### Step 5: Check Residuals of Full Linear Model
+
+```{r}
+plot(glm_linear, which = c(1, 2), pch = 19, col = "darkblue")
+```
+
+### Step 6: Variable Selection with Stepwise AIC
+
+```{r}
+glm_step <- stepAIC(glm_linear, direction = "both", trace = FALSE)
+
+summary(glm_step)
+
+AIC(glm_linear, glm_step)
+```
+
+### Step 7: Check Residuals of Selected Linear Model
+
+```{r}
+plot(glm_step, which = c(1, 2), pch = 19, col = "darkblue")
+```
+
+---
+
+## Part 2: Multinomial Logistic Regression - Predicting Low / Medium / High GDP Group
+
+Because `gdp_group` has three levels (`Low`, `Medium`, and `High`), a binomial logistic GLM is not appropriate if all three groups are retained. Here we use multinomial logistic regression with `Low` as the reference category. The model estimates:
+
+- `Medium vs Low`
+- `High vs Low`
+
+The multinomial model is fitted on standardized predictors. Therefore, its odds ratios are interpreted per 1-standard-deviation increase in each predictor.
+
+### Step 8: Prepare Three-Class GDP Group Outcome and Standardized Predictors
+
+```{r}
+df_multi <- df_glm
+
+df_multi$gdp_group <- factor(df_multi$gdp_group,
+                             levels = c("Low", "Medium", "High"))
+
+df_multi_z <- df_multi
+df_multi_z[, predictors] <- as.data.frame(scale(df_multi_z[, predictors]))
+
+table(df_multi_z$gdp_group)
+levels(df_multi_z$gdp_group)
+contrasts(df_multi_z$gdp_group)
+
+round(colMeans(df_multi_z[, predictors]), 6)
+round(apply(df_multi_z[, predictors], 2, sd), 6)
+```
+
+### Step 9: Fit Full Multinomial Logistic Regression Model
+
+```{r}
+multinom_formula <- as.formula(
+  paste("gdp_group ~", paste(predictors, collapse = " + "))
+)
+
+multinom_full_z <- nnet::multinom(
+  multinom_formula,
+  data = df_multi_z,
+  trace = FALSE,
+  maxit = 1000,
+  Hess = TRUE
+)
+
+summary(multinom_full_z)
+AIC(multinom_full_z)
+logLik(multinom_full_z)
+
+# nnet uses convergence = 0 to indicate successful convergence.
+multinom_full_z$convergence
+```
+
+### Step 10: Likelihood-Ratio Tests for Predictors in the Full Multinomial Model
+
+```{r}
+multinom_lrt_table <- function(full_model, data, response, predictors) {
+  full_ll <- as.numeric(logLik(full_model))
+  full_df <- attr(logLik(full_model), "df")
+  
+  out <- lapply(predictors, function(v) {
+    reduced_predictors <- setdiff(predictors, v)
+    
+    if (length(reduced_predictors) == 0) {
+      reduced_formula <- as.formula(paste(response, "~ 1"))
+    } else {
+      reduced_formula <- as.formula(
+        paste(response, "~", paste(reduced_predictors, collapse = " + "))
+      )
+    }
+    
+    reduced_model <- nnet::multinom(
+      reduced_formula,
+      data = data,
+      trace = FALSE,
+      maxit = 1000,
+      Hess = TRUE
+    )
+    
+    reduced_ll <- as.numeric(logLik(reduced_model))
+    reduced_df <- attr(logLik(reduced_model), "df")
+    
+    LR <- 2 * (full_ll - reduced_ll)
+    df_diff <- full_df - reduced_df
+    p_value <- pmax(
+      pchisq(LR, df = df_diff, lower.tail = FALSE),
+      .Machine$double.xmin
+    )
+    
+    data.frame(
+      term = v,
+      LR_statistic = LR,
+      df = df_diff,
+      p_value = p_value
+    )
+  })
+  
+  out <- do.call(rbind, out)
+  out$p_value_holm <- p.adjust(out$p_value, method = "holm")
+  out[order(out$p_value), ]
+}
+
+lrt_full_z <- multinom_lrt_table(
+  full_model = multinom_full_z,
+  data = df_multi_z,
+  response = "gdp_group",
+  predictors = predictors
+)
+
+lrt_full_z
+```
+
+### Step 11: Variable Selection with Stepwise AIC
+
+```{r}
+multinom_step_z <- tryCatch(
+  stepAIC(multinom_full_z, direction = "both", trace = FALSE),
+  error = function(e) {
+    message("stepAIC failed for multinomial model. Retaining the full model. Error message: ", e$message)
+    multinom_full_z
+  }
+)
+
+summary(multinom_step_z)
+AIC(multinom_full_z, multinom_step_z)
+multinom_step_z$convergence
+
+selected_multinom_predictors <- attr(terms(multinom_step_z), "term.labels")
+selected_multinom_predictors
+```
+
+### Step 12: Likelihood-Ratio Tests for Predictors in the Selected Multinomial Model
+
+```{r}
+if (length(selected_multinom_predictors) > 0) {
+  lrt_selected_z <- multinom_lrt_table(
+    full_model = multinom_step_z,
+    data = df_multi_z,
+    response = "gdp_group",
+    predictors = selected_multinom_predictors
+  )
+  lrt_selected_z
+} else {
+  cat("The selected multinomial model contains only an intercept. No predictor-level LRTs are shown.\n")
+}
+```
+
+### Step 13: Coefficient and Odds Ratio Tables for Medium vs Low and High vs Low
+
+```{r}
+make_multinom_table <- function(model, reference_level = "Low") {
+  sm <- summary(model)
+  beta <- sm$coefficients
+  se <- sm$standard.errors
+  
+  if (is.vector(beta)) {
+    beta <- matrix(beta, nrow = 1)
+    rownames(beta) <- names(coef(model))
+    colnames(beta) <- names(coef(model))
+  }
+  
+  if (is.vector(se)) {
+    se <- matrix(se, nrow = 1)
+    rownames(se) <- rownames(beta)
+    colnames(se) <- colnames(beta)
+  }
+  
+  out <- lapply(rownames(beta), function(outcome_level) {
+    z_value <- beta[outcome_level, ] / se[outcome_level, ]
+    p_value <- pmax(
+      2 * pnorm(abs(z_value), lower.tail = FALSE),
+      .Machine$double.xmin
+    )
+    
+    data.frame(
+      comparison = paste(outcome_level, "vs", reference_level),
+      term = colnames(beta),
+      estimate_per_1SD = beta[outcome_level, ],
+      std_error = se[outcome_level, ],
+      z_value = z_value,
+      p_value = p_value,
+      OR_per_1SD = exp(beta[outcome_level, ]),
+      CI_low = exp(beta[outcome_level, ] - 1.96 * se[outcome_level, ]),
+      CI_high = exp(beta[outcome_level, ] + 1.96 * se[outcome_level, ]),
+      row.names = NULL
+    )
+  })
+  
+  do.call(rbind, out)
+}
+
+or_table_per_1sd <- make_multinom_table(multinom_step_z, reference_level = "Low")
+or_table_per_1sd
+
+or_table_per_1sd_no_intercept <- subset(or_table_per_1sd, term != "(Intercept)")
+or_table_per_1sd_no_intercept
+```
+
+### Step 14: Evaluate In-Sample Three-Class Classification Performance
+
+```{r}
+pred_class_multi <- predict(multinom_step_z, newdata = df_multi_z, type = "class")
+pred_class_multi <- factor(pred_class_multi, levels = c("Low", "Medium", "High"))
+
+pred_prob_multi <- predict(multinom_step_z, newdata = df_multi_z, type = "probs")
+head(pred_prob_multi)
+
+conf_mat_multi <- table(Predicted = pred_class_multi, Actual = df_multi_z$gdp_group)
+conf_mat_multi
+
+accuracy_multi <- mean(pred_class_multi == df_multi_z$gdp_group)
+cat("In-sample three-class accuracy:", round(accuracy_multi, 3), "\n")
+
+class_metrics <- function(conf_mat) {
+  classes <- colnames(conf_mat)
+  out <- lapply(classes, function(cl) {
+    TP <- conf_mat[cl, cl]
+    precision <- ifelse(sum(conf_mat[cl, ]) == 0, NA, TP / sum(conf_mat[cl, ]))
+    recall <- ifelse(sum(conf_mat[, cl]) == 0, NA, TP / sum(conf_mat[, cl]))
+    F1 <- ifelse(is.na(precision) || is.na(recall) || precision + recall == 0,
+                 NA,
+                 2 * precision * recall / (precision + recall))
+    data.frame(
+      class = cl,
+      precision = precision,
+      recall_sensitivity = recall,
+      F1 = F1
+    )
+  })
+  do.call(rbind, out)
+}
+
+metrics_multi <- class_metrics(conf_mat_multi)
+metrics_multi
+
+macro_F1_multi <- mean(metrics_multi$F1, na.rm = TRUE)
+cat("In-sample macro-F1:", round(macro_F1_multi, 3), "\n")
+```
+
+### Step 15: Five-Fold Cross-Validation for the Three-Class Multinomial Model
+
+```{r}
+set.seed(20260430)
+
+K <- 5
+folds_multi <- rep(NA_integer_, nrow(df_multi))
+
+for (g in levels(df_multi$gdp_group)) {
+  idx <- which(df_multi$gdp_group == g)
+  folds_multi[idx] <- sample(rep(1:K, length.out = length(idx)))
+}
+
+scale_train_test <- function(train_data, test_data, predictors) {
+  train_scaled <- train_data
+  test_scaled <- test_data
+  
+  for (v in predictors) {
+    mu <- mean(train_data[[v]], na.rm = TRUE)
+    sigma <- sd(train_data[[v]], na.rm = TRUE)
+    
+    if (is.na(sigma) || sigma == 0) {
+      sigma <- 1
+    }
+    
+    train_scaled[[v]] <- (train_data[[v]] - mu) / sigma
+    test_scaled[[v]] <- (test_data[[v]] - mu) / sigma
+  }
+  
+  list(train = train_scaled, test = test_scaled)
+}
+
+cv_pred_class_multi <- rep(NA_character_, nrow(df_multi))
+cv_selected_terms_multi <- vector("list", K)
+
+for (k in 1:K) {
+  train_data <- df_multi[folds_multi != k, ]
+  test_data  <- df_multi[folds_multi == k, ]
+  
+  train_data$gdp_group <- factor(train_data$gdp_group, levels = c("Low", "Medium", "High"))
+  test_data$gdp_group <- factor(test_data$gdp_group, levels = c("Low", "Medium", "High"))
+  
+  scaled <- scale_train_test(train_data, test_data, predictors)
+  train_z <- scaled$train
+  test_z <- scaled$test
+  
+  cv_full <- nnet::multinom(
+    multinom_formula,
+    data = train_z,
+    trace = FALSE,
+    maxit = 1000,
+    Hess = TRUE
+  )
+  
+  cv_step <- tryCatch(
+    stepAIC(cv_full, direction = "both", trace = FALSE),
+    error = function(e) cv_full
+  )
+  
+  cv_selected_terms_multi[[k]] <- attr(terms(cv_step), "term.labels")
+  
+  cv_pred_class_multi[folds_multi == k] <- as.character(
+    predict(cv_step, newdata = test_z, type = "class")
+  )
+}
+
+cv_pred_class_multi <- factor(cv_pred_class_multi,
+                              levels = c("Low", "Medium", "High"))
+
+cv_conf_mat_multi <- table(Predicted = cv_pred_class_multi,
+                           Actual = df_multi$gdp_group)
+cv_conf_mat_multi
+
+cv_accuracy_multi <- mean(cv_pred_class_multi == df_multi$gdp_group)
+cat("5-fold CV three-class accuracy:", round(cv_accuracy_multi, 3), "\n")
+
+cv_metrics_multi <- class_metrics(cv_conf_mat_multi)
+cv_metrics_multi
+
+cv_macro_F1_multi <- mean(cv_metrics_multi$F1, na.rm = TRUE)
+cat("5-fold CV macro-F1:", round(cv_macro_F1_multi, 3), "\n")
+
+cv_selected_terms_multi
+```
+
+### Step 16: Probability Diagnostics for the Selected Multinomial Model
+
+```{r}
+prob_df <- data.frame(
+  actual = df_multi_z$gdp_group,
+  pred_class = pred_class_multi,
+  prob_low = pred_prob_multi[, "Low"],
+  prob_medium = pred_prob_multi[, "Medium"],
+  prob_high = pred_prob_multi[, "High"]
+)
+
+boxplot(prob_low ~ actual, data = prob_df,
+        col = "lightblue",
+        main = "Predicted Probability of Low by Actual GDP Group",
+        xlab = "Actual GDP Group", ylab = "Predicted probability of Low")
+
+boxplot(prob_medium ~ actual, data = prob_df,
+        col = "lightblue",
+        main = "Predicted Probability of Medium by Actual GDP Group",
+        xlab = "Actual GDP Group", ylab = "Predicted probability of Medium")
+
+boxplot(prob_high ~ actual, data = prob_df,
+        col = "lightblue",
+        main = "Predicted Probability of High by Actual GDP Group",
+        xlab = "Actual GDP Group", ylab = "Predicted probability of High")
+```
+
+---
+
+## Final Summary of GLM Results
+
+```{r}
+cat("Linear model - full adjusted R-squared:",
+    round(summary(glm_linear)$adj.r.squared, 4), "\n")
+cat("Linear model - selected adjusted R-squared:",
+    round(summary(glm_step)$adj.r.squared, 4), "\n")
+cat("Linear model - full AIC:", round(AIC(glm_linear), 3), "\n")
+cat("Linear model - selected AIC:", round(AIC(glm_step), 3), "\n")
+cat("Selected linear-model variables:",
+    paste(attr(terms(glm_step), "term.labels"), collapse = ", "), "\n")
+
+cat("\nMultinomial model reference group: Low\n")
+cat("Multinomial model predictors were standardized before fitting.\n")
+cat("Selected multinomial-model variables:",
+    paste(selected_multinom_predictors, collapse = ", "), "\n")
+cat("Multinomial model - convergence code:", multinom_step_z$convergence, "\n")
+cat("Multinomial model - in-sample three-class accuracy:",
+    round(accuracy_multi, 3), "\n")
+cat("Multinomial model - in-sample macro-F1:",
+    round(macro_F1_multi, 3), "\n")
+cat("Multinomial model - 5-fold CV three-class accuracy:",
+    round(cv_accuracy_multi, 3), "\n")
+cat("Multinomial model - 5-fold CV macro-F1:",
+    round(cv_macro_F1_multi, 3), "\n")
+
+cat("\nClass-specific in-sample metrics:\n")
+print(metrics_multi)
+
+cat("\nClass-specific 5-fold CV metrics:\n")
+print(cv_metrics_multi)
+
+cat("\nSelected multinomial odds ratios per 1-SD increase, excluding intercept:\n")
+print(or_table_per_1sd_no_intercept)
+```

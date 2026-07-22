@@ -1,0 +1,635 @@
+---
+title: "Cluster Analysis"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5,
+  out.width = "90%"
+)
+options(width = 100)
+```
+
+## Cluster Analysis on Brazil Microregion Data
+
+This analysis clusters Brazilian microregions using selected socioeconomic, climate, and environmental variables. Because the clustering variables include both `gdp` and `building_area`, the clusters should be interpreted as **economic-environmental clusters**, not as purely climate clusters.
+
+The four-cluster k-means solution is used as the primary solution because it provides an interpretable economic-environmental classification and, in the current output, gives the highest average silhouette width among k = 2 to k = 10. `NbClust` is treated as an additional diagnostic rather than as the sole decision rule.
+
+Load required libraries.
+
+```{r}
+library(cluster)
+library(factoextra)
+library(NbClust)
+library(ggplot2)
+```
+
+Load the prepared data and define variables.
+
+```{r}
+load("/cloud/project/data/prepared_data.RData")
+
+# Basic checks
+stopifnot(exists("df"))
+stopifnot(exists("num_vars"))
+
+# Keep a row identifier so clusters can be traced back to original observations.
+df$.row_id <- seq_len(nrow(df))
+
+# Stable factor ordering for interpretation.
+if ("region" %in% names(df)) {
+  region_levels <- c("Centro-Oeste", "Nordeste", "Norte", "Sudeste", "Sul")
+  if (all(region_levels %in% unique(df$region))) {
+    df$region <- factor(df$region, levels = region_levels)
+  } else {
+    df$region <- factor(df$region)
+  }
+}
+
+if ("gdp_group" %in% names(df)) {
+  df$gdp_group <- factor(df$gdp_group, levels = c("Low", "Medium", "High"))
+}
+
+# Selected variables for clustering.
+# These follow the original PCA/cluster workflow after removing temp_min and temp_max.
+cluster_vars <- c(
+  "building_area", "gdp", "temp_mean", "humidity", "pressure",
+  "wind_speed", "ndvi", "pdsi", "precip", "rainy_days"
+)
+
+# Confirm all variables exist.
+missing_cluster_vars <- setdiff(cluster_vars, names(df))
+if (length(missing_cluster_vars) > 0) {
+  stop("The following clustering variables are missing from df: ",
+       paste(missing_cluster_vars, collapse = ", "))
+}
+
+# Use complete cases for clustering.
+cluster_needed <- unique(c(".row_id", cluster_vars, "region", "gdp_group"))
+cluster_needed <- cluster_needed[cluster_needed %in% names(df)]
+
+df_cluster <- df[complete.cases(df[, cluster_vars]), cluster_needed]
+
+# Confirm data size and grouping variables.
+dim(df_cluster)
+summary(df_cluster[, cluster_vars])
+
+if ("region" %in% names(df_cluster)) {
+  table(df_cluster$region)
+}
+
+if ("gdp_group" %in% names(df_cluster)) {
+  table(df_cluster$gdp_group)
+}
+```
+
+---
+
+## Step 1: Standardize Clustering Variables
+
+Clustering is performed on standardized variables so that variables measured on large scales, especially `building_area`, `gdp`, and `precip`, do not dominate the distance calculation purely because of their units.
+
+```{r}
+kdata <- scale(df_cluster[, cluster_vars])
+
+# Check standardization.
+round(colMeans(kdata), 6)
+round(apply(kdata, 2, sd), 6)
+```
+
+---
+
+## Step 2: Inspect Correlations Among Clustering Variables
+
+```{r}
+cor_mat <- cor(df_cluster[, cluster_vars], use = "pairwise.complete.obs")
+round(cor_mat, 2)
+```
+
+```{r correlation-heatmap, fig.width=7, fig.height=6, out.width="90%"}
+# Cleaner heatmap than base::heatmap so axis labels are not clipped in the PDF.
+cor_long <- as.data.frame(as.table(cor_mat))
+names(cor_long) <- c("var1", "var2", "correlation")
+
+ggplot(cor_long, aes(x = var1, y = var2, fill = correlation)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", correlation)), size = 2.7) +
+  coord_equal() +
+  scale_fill_gradient2(limits = c(-1, 1)) +
+  labs(
+    title = "Correlation Heatmap of Clustering Variables",
+    x = NULL,
+    y = NULL,
+    fill = "r"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  )
+```
+
+---
+
+## Step 3: Hierarchical Clustering with Euclidean Distance and Ward.D2
+
+Ward clustering is conventionally paired with Euclidean distance. We therefore use `dist(..., method = "euclidean")` and `hclust(..., method = "ward.D2")`.
+
+```{r hierarchical-dendrogram, fig.width=7, fig.height=5, out.width="90%"}
+dist_euclidean <- dist(kdata, method = "euclidean")
+
+hc_ward <- hclust(dist_euclidean, method = "ward.D2")
+
+plot(hc_ward,
+     labels = FALSE,
+     hang = -1,
+     main = "Hierarchical Clustering: Euclidean Distance + Ward.D2",
+     xlab = "Microregions",
+     ylab = "Height")
+
+rect.hclust(hc_ward, k = 4, border = 2:5)
+```
+```{r}
+## Step 3b: Hierarchical Clustering with Complete Linkage (Comparison)
+
+hc_complete <- hclust(dist_euclidean, method = "complete")
+
+plot(hc_complete,
+     labels = FALSE,
+     hang = -1,
+     main = "Hierarchical Clustering: Euclidean Distance + Complete Linkage",
+     xlab = "Microregions",
+     ylab = "Height")
+
+rect.hclust(hc_complete, k = 4, border = 2:5)
+```
+
+---
+
+## Step 4: Hierarchical Cluster Assignments for k = 4 and k = 6
+
+This section keeps the hierarchical k = 4 and k = 6 assignments for comparison with k-means and with the earlier workflow. The primary clustering interpretation below is based on k-means k = 4.
+
+```{r}
+hc4 <- cutree(hc_ward, k = 4)
+hc6 <- cutree(hc_ward, k = 6)
+
+df_cluster$hc4 <- factor(hc4)
+df_cluster$hc6 <- factor(hc6)
+
+cat("Hierarchical k = 4 cluster sizes:\n")
+print(table(df_cluster$hc4))
+
+cat("Hierarchical k = 6 cluster sizes:\n")
+print(table(df_cluster$hc6))
+
+if ("region" %in% names(df_cluster)) {
+  hc4_region_table <- table(Hierarchical_k4 = df_cluster$hc4,
+                            Region = df_cluster$region)
+  hc6_region_table <- table(Hierarchical_k6 = df_cluster$hc6,
+                            Region = df_cluster$region)
+  
+  cat("Hierarchical k = 4 counts by region:\n")
+  print(hc4_region_table)
+  cat("Hierarchical k = 4 row proportions by region:\n")
+  print(round(prop.table(hc4_region_table, margin = 1), 3))
+  
+  cat("Hierarchical k = 6 counts by region:\n")
+  print(hc6_region_table)
+  cat("Hierarchical k = 6 row proportions by region:\n")
+  print(round(prop.table(hc6_region_table, margin = 1), 3))
+}
+
+if ("gdp_group" %in% names(df_cluster)) {
+  hc4_gdp_table <- table(Hierarchical_k4 = df_cluster$hc4,
+                         GDP_Group = df_cluster$gdp_group)
+  hc6_gdp_table <- table(Hierarchical_k6 = df_cluster$hc6,
+                         GDP_Group = df_cluster$gdp_group)
+  
+  cat("Hierarchical k = 4 counts by GDP group:\n")
+  print(hc4_gdp_table)
+  cat("Hierarchical k = 4 row proportions by GDP group:\n")
+  print(round(prop.table(hc4_gdp_table, margin = 1), 3))
+  
+  cat("Hierarchical k = 6 counts by GDP group:\n")
+  print(hc6_gdp_table)
+  cat("Hierarchical k = 6 row proportions by GDP group:\n")
+  print(round(prop.table(hc6_gdp_table, margin = 1), 3))
+}
+```
+
+---
+
+## Step 5: Evaluate Candidate Number of Clusters
+
+We evaluate k = 2 to k = 10 using within-cluster sum of squares, average silhouette width, and `NbClust`. The final number of clusters is selected by combining diagnostics with interpretability.
+
+```{r elbow-plot, fig.width=7, fig.height=5, out.width="90%"}
+set.seed(20260430)
+
+k_range <- 2:10
+
+wss <- sapply(k_range, function(k) {
+  km <- kmeans(kdata, centers = k, nstart = 50, iter.max = 100)
+  km$tot.withinss
+})
+
+plot(k_range, wss,
+     type = "b",
+     pch = 19,
+     xlab = "Number of clusters (k)",
+     ylab = "Total within-cluster sum of squares",
+     main = "Elbow Plot for k-means")
+```
+
+```{r silhouette-evaluation-plot, fig.width=7, fig.height=5, out.width="90%"}
+sil_width <- sapply(k_range, function(k) {
+  km <- kmeans(kdata, centers = k, nstart = 50, iter.max = 100)
+  sil <- silhouette(km$cluster, dist_euclidean)
+  mean(sil[, "sil_width"])
+})
+
+plot(k_range, sil_width,
+     type = "b",
+     pch = 19,
+     xlab = "Number of clusters (k)",
+     ylab = "Average silhouette width",
+     main = "Silhouette Evaluation for k-means")
+```
+
+```{r}
+cluster_eval <- data.frame(
+  k = k_range,
+  total_withinss = wss,
+  avg_silhouette = sil_width
+)
+cluster_eval
+
+best_silhouette_k <- cluster_eval$k[which.max(cluster_eval$avg_silhouette)]
+cat("Best k by average silhouette width:", best_silhouette_k, "\n")
+```
+
+### NbClust Evaluation
+
+```{r nbclust-evaluation, fig.width=7, fig.height=5, out.width="90%"}
+set.seed(20260430)
+
+nbclust_result <- tryCatch(
+  NbClust::NbClust(
+    data = as.data.frame(kdata),
+    distance = "euclidean",
+    min.nc = min(k_range),
+    max.nc = max(k_range),
+    method = "ward.D2",
+    index = "all"
+  ),
+  error = function(e) {
+    message("NbClust failed. Continuing without NbClust output. Error message: ", e$message)
+    NULL
+  }
+)
+
+nbclust_votes_valid <- NULL
+nbclust_votes_raw <- NULL
+
+if (!is.null(nbclust_result)) {
+  nb_best <- nbclust_result$Best.nc
+  nb_best
+  
+  if (is.matrix(nb_best)) {
+    best_k_values_raw <- nb_best[1, ]
+    best_k_values_raw <- best_k_values_raw[!is.na(best_k_values_raw)]
+    
+    # Some graphical indices can return 0. Those are not admissible cluster numbers
+    # and should not be counted as valid votes for k.
+    best_k_values_valid <- best_k_values_raw[best_k_values_raw %in% k_range]
+    
+    nbclust_votes_raw <- sort(table(best_k_values_raw), decreasing = TRUE)
+    nbclust_votes_valid <- sort(table(best_k_values_valid), decreasing = TRUE)
+    
+    cat("NbClust raw vote summary, before filtering invalid values:\n")
+    print(nbclust_votes_raw)
+    
+    cat("NbClust valid vote summary, restricted to k = 2 to 10:\n")
+    print(nbclust_votes_valid)
+  }
+}
+```
+
+---
+
+## Step 6: Primary k-means Solution with k = 4
+
+The k = 4 solution is retained as the primary interpretable economic-environmental cluster solution. We use a fixed random seed, `nstart = 50`, and `iter.max = 100` to improve reproducibility.
+
+```{r}
+set.seed(20260430)
+
+km4 <- kmeans(
+  kdata,
+  centers = 4,
+  nstart = 50,
+  iter.max = 100
+)
+
+df_cluster$km4 <- factor(km4$cluster)
+
+cat("k-means k = 4 cluster sizes:\n")
+print(table(df_cluster$km4))
+
+cat("k-means k = 4 within-cluster SS by cluster:\n")
+print(km4$withinss)
+
+cat("k-means k = 4 total within-cluster SS:", round(km4$tot.withinss, 4), "\n")
+cat("k-means k = 4 between-cluster SS / total SS:",
+    round(km4$betweenss / km4$totss, 4), "\n")
+cat("k-means k = 4 iterations:", km4$iter, "\n")
+cat("k-means k = 4 ifault code:", km4$ifault, "\n")
+```
+
+---
+
+## Step 7: Describe k = 4 Cluster Centers
+
+Cluster centers are shown both in standardized units and original units. Standardized centers are useful for comparing variable profiles; original-unit centers are easier to interpret substantively.
+
+```{r}
+# Standardized centers.
+km4_centers_z <- as.data.frame(km4$centers)
+km4_centers_z$cluster <- factor(seq_len(nrow(km4_centers_z)))
+km4_centers_z <- km4_centers_z[, c("cluster", cluster_vars)]
+km4_centers_z
+
+# Original-unit means by k-means cluster.
+km4_centers_original <- aggregate(df_cluster[, cluster_vars],
+                                  by = list(km4 = df_cluster$km4),
+                                  FUN = mean)
+km4_centers_original
+
+# Standard deviations by k-means cluster in original units.
+km4_sds_original <- aggregate(df_cluster[, cluster_vars],
+                              by = list(km4 = df_cluster$km4),
+                              FUN = sd)
+km4_sds_original
+```
+
+---
+
+## Step 8: k = 4 Cluster Composition by Region and GDP Group
+
+```{r}
+if ("region" %in% names(df_cluster)) {
+  km4_region_table <- table(Cluster = df_cluster$km4,
+                            Region = df_cluster$region)
+  
+  cat("k-means k = 4 counts by region:\n")
+  print(km4_region_table)
+  
+  cat("k-means k = 4 row proportions by region:\n")
+  km4_region_prop <- prop.table(km4_region_table, margin = 1)
+  print(round(km4_region_prop, 3))
+}
+
+if ("gdp_group" %in% names(df_cluster)) {
+  km4_gdp_table <- table(Cluster = df_cluster$km4,
+                         GDP_Group = df_cluster$gdp_group)
+  
+  cat("k-means k = 4 counts by GDP group:\n")
+  print(km4_gdp_table)
+  
+  cat("k-means k = 4 row proportions by GDP group:\n")
+  km4_gdp_prop <- prop.table(km4_gdp_table, margin = 1)
+  print(round(km4_gdp_prop, 3))
+}
+```
+
+---
+
+## Step 9: Visualize k = 4 Clusters in PCA Space
+
+```{r pca-space-base, fig.width=7, fig.height=5, out.width="90%"}
+pca_cluster <- prcomp(kdata, center = FALSE, scale. = FALSE)
+
+pca_scores <- as.data.frame(pca_cluster$x[, 1:2])
+pca_scores$km4 <- df_cluster$km4
+pca_scores$region <- if ("region" %in% names(df_cluster)) df_cluster$region else NA
+pca_scores$gdp_group <- if ("gdp_group" %in% names(df_cluster)) df_cluster$gdp_group else NA
+
+var_explained <- summary(pca_cluster)$importance[2, 1:2]
+
+plot(pca_scores$PC1, pca_scores$PC2,
+     col = as.integer(pca_scores$km4),
+     pch = 19,
+     xlab = paste0("PC1 (", round(100 * var_explained[1], 1), "%)"),
+     ylab = paste0("PC2 (", round(100 * var_explained[2], 1), "%)"),
+     main = "k-means k = 4 Clusters in PCA Space")
+legend("topright",
+       legend = levels(pca_scores$km4),
+       col = seq_along(levels(pca_scores$km4)),
+       pch = 19,
+       title = "Cluster")
+```
+
+```{r pca-space-factoextra, fig.width=7, fig.height=5, out.width="90%"}
+factoextra::fviz_cluster(
+  km4,
+  data = kdata,
+  geom = "point",
+  ellipse.type = "convex",
+  main = "k-means k = 4 Economic-Environmental Clusters"
+)
+```
+
+---
+
+## Step 10: Sensitivity Analyses for Alternative k Values
+
+The current diagnostics show that k = 4 has the highest average silhouette width, while `NbClust` votes may support alternative k values. Therefore, we examine k = 2 and k = 5 as diagnostic sensitivity analyses. We also keep k = 6 as an optional continuity check because it was considered in the earlier workflow.
+
+```{r}
+run_kmeans_solution <- function(k, kdata, df_cluster, cluster_vars, dist_obj) {
+  set.seed(20260430 + k)
+  km <- kmeans(kdata, centers = k, nstart = 50, iter.max = 100)
+  cluster_factor <- factor(km$cluster)
+  sil <- silhouette(km$cluster, dist_obj)
+  
+  centers_z <- as.data.frame(km$centers)
+  centers_z$cluster <- factor(seq_len(nrow(centers_z)))
+  centers_z <- centers_z[, c("cluster", cluster_vars)]
+  
+  centers_original <- aggregate(df_cluster[, cluster_vars],
+                                by = list(cluster = cluster_factor),
+                                FUN = mean)
+  
+  list(
+    k = k,
+    km = km,
+    cluster_factor = cluster_factor,
+    avg_silhouette = mean(sil[, "sil_width"]),
+    centers_z = centers_z,
+    centers_original = centers_original,
+    silhouette = sil
+  )
+}
+
+sensitivity_ks <- c(2, 5, 6)
+sensitivity_results <- lapply(sensitivity_ks, run_kmeans_solution,
+                              kdata = kdata,
+                              df_cluster = df_cluster,
+                              cluster_vars = cluster_vars,
+                              dist_obj = dist_euclidean)
+names(sensitivity_results) <- paste0("k", sensitivity_ks)
+
+for (name in names(sensitivity_results)) {
+  res <- sensitivity_results[[name]]
+  k <- res$k
+  
+  df_cluster[[paste0("km", k)]] <- res$cluster_factor
+  
+  cat("\n==============================\n")
+  cat("Sensitivity k =", k, "\n")
+  cat("==============================\n")
+  
+  cat("Cluster sizes:\n")
+  print(table(res$cluster_factor))
+  
+  cat("Between-cluster SS / total SS:",
+      round(res$km$betweenss / res$km$totss, 4), "\n")
+  cat("Average silhouette:", round(res$avg_silhouette, 4), "\n")
+  cat("Iterations:", res$km$iter, "\n")
+  cat("ifault code:", res$km$ifault, "\n")
+  
+  cat("Standardized centers:\n")
+  print(res$centers_z)
+  
+  cat("Original-unit centers:\n")
+  print(res$centers_original)
+  
+  if ("region" %in% names(df_cluster)) {
+    reg_tab <- table(Cluster = res$cluster_factor,
+                     Region = df_cluster$region)
+    cat("Counts by region:\n")
+    print(reg_tab)
+    cat("Row proportions by region:\n")
+    print(round(prop.table(reg_tab, margin = 1), 3))
+  }
+  
+  if ("gdp_group" %in% names(df_cluster)) {
+    gdp_tab <- table(Cluster = res$cluster_factor,
+                     GDP_Group = df_cluster$gdp_group)
+    cat("Counts by GDP group:\n")
+    print(gdp_tab)
+    cat("Row proportions by GDP group:\n")
+    print(round(prop.table(gdp_tab, margin = 1), 3))
+  }
+}
+```
+
+---
+
+## Step 11: Compare Primary k = 4 with Alternative k Values
+
+```{r}
+for (k in sensitivity_ks) {
+  cat("\nCross-tabulation: primary km4 vs sensitivity k =", k, "\n")
+  print(table(km4 = df_cluster$km4,
+              sensitivity = df_cluster[[paste0("km", k)]]))
+}
+
+sil4 <- silhouette(km4$cluster, dist_euclidean)
+
+silhouette_summary <- data.frame(
+  k = c(4, sensitivity_ks),
+  avg_silhouette = c(
+    mean(sil4[, "sil_width"]),
+    sapply(sensitivity_results, function(x) x$avg_silhouette)
+  ),
+  between_ss_over_total_ss = c(
+    km4$betweenss / km4$totss,
+    sapply(sensitivity_results, function(x) x$km$betweenss / x$km$totss)
+  )
+)
+
+silhouette_summary <- silhouette_summary[order(silhouette_summary$k), ]
+silhouette_summary
+```
+
+```{r silhouette-primary-k4, fig.width=7, fig.height=5, out.width="90%"}
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
+plot(sil4, main = "Silhouette Plot: Primary k = 4")
+```
+
+```{r silhouette-sensitivity-k2, fig.width=7, fig.height=5, out.width="90%"}
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
+plot(sensitivity_results[["k2"]]$silhouette,
+     main = "Silhouette Plot: Sensitivity k = 2")
+```
+
+```{r silhouette-sensitivity-k5, fig.width=7, fig.height=5, out.width="90%"}
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
+plot(sensitivity_results[["k5"]]$silhouette,
+     main = "Silhouette Plot: Sensitivity k = 5")
+```
+
+```{r silhouette-sensitivity-k6, fig.width=7, fig.height=5, out.width="90%"}
+par(mfrow = c(1, 1), mar = c(5, 4, 4, 2) + 0.1)
+plot(sensitivity_results[["k6"]]$silhouette,
+     main = "Silhouette Plot: Sensitivity k = 6")
+```
+
+---
+
+## Step 12: Optional - Export Cluster Assignments
+
+```{r}
+cluster_cols <- c(".row_id", "km4", paste0("km", sensitivity_ks), "hc4", "hc6")
+cluster_cols <- cluster_cols[cluster_cols %in% names(df_cluster)]
+
+cluster_assignments <- df_cluster[, cluster_cols]
+
+if ("region" %in% names(df_cluster)) {
+  cluster_assignments$region <- df_cluster$region
+}
+
+if ("gdp_group" %in% names(df_cluster)) {
+  cluster_assignments$gdp_group <- df_cluster$gdp_group
+}
+
+head(cluster_assignments)
+
+# Uncomment if you want to save the assignments.
+# write.csv(cluster_assignments, "cluster_assignments.csv", row.names = FALSE)
+```
+
+---
+
+## Final Summary
+
+```{r}
+cat("Cluster variables:\n")
+print(cluster_vars)
+
+cat("\nPrimary clustering method: k-means with k = 4, nstart = 50, iter.max = 100\n")
+cat("Primary interpretation: economic-environmental clusters\n")
+cat("Primary k = 4 between-cluster SS / total SS:", round(km4$betweenss / km4$totss, 4), "\n")
+cat("Primary k = 4 average silhouette:", round(mean(sil4[, "sil_width"]), 4), "\n")
+cat("Best k by average silhouette width across k = 2 to 10:", best_silhouette_k, "\n")
+
+cat("\nCandidate-k evaluation table:\n")
+print(cluster_eval)
+
+if (!is.null(nbclust_votes_valid)) {
+  cat("\nNbClust valid vote summary, excluding invalid k values:\n")
+  print(nbclust_votes_valid)
+}
+
+cat("\nSensitivity summary:\n")
+print(silhouette_summary)
+```

@@ -1,0 +1,541 @@
+---
+title: "MANOVA"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## MANOVA on Brazil Microregion Data
+
+We test whether selected climate and environmental variables differ significantly across geographic regions. We also test whether selected climate and environmental variables differ among **Low**, **Medium**, and **High** GDP microregions.
+
+For the GDP-group MANOVA, all three GDP groups are retained. **Low** is used as the reference category for the follow-up contrasts, so the pairwise contrasts are interpreted as:
+
+- `Medium vs Low`
+- `High vs Low`
+
+Load required libraries.
+
+```{r}
+library(MASS)
+library(biotools)
+
+# Prevent rgl/X11 warnings when knitting on a server or Posit Cloud.
+options(rgl.useNULL = TRUE)
+library(heplots)
+
+library(klaR)
+library(car)
+```
+
+Load the prepared data and define the variables for analysis.
+
+```{r}
+load("/cloud/project/data/prepared_data.RData")
+
+# Basic checks
+stopifnot(exists("df"))
+stopifnot(exists("num_vars"))
+
+# Region MANOVA response variables.
+# These are the variables used in the original region MANOVA analysis.
+resp_vars_region <- c(
+  "temp_mean", "temp_min", "temp_max",
+  "humidity", "precip", "rainy_days", "ndvi"
+)
+
+# GDP-group MANOVA response variables.
+# These match the original GDP-group MANOVA section.
+resp_vars_gdp <- c(
+  "temp_mean", "humidity", "precip", "rainy_days", "ndvi"
+)
+
+# Check that all required variables exist.
+required_vars <- unique(c("region", "gdp_group", resp_vars_region, resp_vars_gdp))
+missing_vars <- setdiff(required_vars, names(df))
+if (length(missing_vars) > 0) {
+  stop("The following required variables are missing from df: ",
+       paste(missing_vars, collapse = ", "))
+}
+
+# Make sure region has a stable and interpretable order.
+region_levels <- c("Centro-Oeste", "Nordeste", "Norte", "Sudeste", "Sul")
+if (all(region_levels %in% unique(df$region))) {
+  df$region <- factor(df$region, levels = region_levels)
+} else {
+  df$region <- factor(df$region)
+}
+
+# Make sure gdp_group has the intended order.
+# Low is the reference group for follow-up treatment-contrast models.
+df$gdp_group <- factor(df$gdp_group, levels = c("Low", "Medium", "High"))
+
+# Use complete cases for each analysis.
+df_region <- df[complete.cases(df[, c("region", resp_vars_region)]), ]
+df_gdp <- df[complete.cases(df[, c("gdp_group", resp_vars_gdp)]), ]
+
+# Confirm grouping variables.
+table(df_region$region)
+table(df_gdp$gdp_group)
+
+# Confirm response variables.
+resp_vars_region
+resp_vars_gdp
+```
+
+---
+
+## Step 1: Check Multivariate Normality Within Each Region
+
+```{r}
+# Chi-square Q-Q plots for each region.
+for (i in seq_along(levels(df_region$region))) {
+  current_region <- levels(df_region$region)[i]
+  cqplot(df_region[df_region$region == current_region, resp_vars_region],
+         main = paste(current_region))
+}
+```
+
+---
+
+## Step 2: Boxplots by Region
+
+Visualize group differences for each response variable.
+
+```{r}
+for (v in resp_vars_region) {
+  boxplot(df_region[[v]] ~ df_region$region,
+          col = "lightblue",
+          main = paste(v, "by Region"),
+          xlab = "Region",
+          ylab = v,
+          cex.axis = 0.8)
+  
+  means <- tapply(df_region[[v]], df_region$region, mean, na.rm = TRUE)
+  points(seq_along(means), means, col = "red", pch = 19, cex = 1.2)
+  
+  y_offset <- 0.04 * diff(range(df_region[[v]], na.rm = TRUE))
+  text(x = seq_along(means),
+       y = means + y_offset,
+       labels = round(means, 2),
+       cex = 0.8)
+}
+```
+
+---
+
+## Step 3: Descriptive Statistics by Region
+
+```{r}
+region_means <- aggregate(df_region[, resp_vars_region],
+                          by = list(region = df_region$region),
+                          FUN = mean)
+region_means
+
+region_sds <- aggregate(df_region[, resp_vars_region],
+                        by = list(region = df_region$region),
+                        FUN = sd)
+region_sds
+```
+
+---
+
+## Step 4: Check Homogeneity of Covariance Matrices by Region
+
+Box's M test is sensitive to departures from normality, so it should be treated as a diagnostic rather than as a strict decision rule. When covariance matrices are heterogeneous, Pillai's trace is preferred as the primary MANOVA statistic.
+
+```{r}
+boxm_region <- try(
+  biotools::boxM(df_region[, resp_vars_region], grouping = df_region$region),
+  silent = TRUE
+)
+boxm_region
+```
+
+---
+
+## Step 5: Run One-Way MANOVA by Region
+
+```{r}
+# Save the current contrast options so they can be restored at the end.
+old_options <- options()
+
+# Use sum contrasts for Type III tests.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+manova_region <- lm(
+  cbind(temp_mean, temp_min, temp_max,
+        humidity, precip, rainy_days, ndvi) ~ region,
+  data = df_region
+)
+
+# Univariate ANOVA results for each response variable.
+summary.aov(manova_region)
+
+# Multivariate tests.
+anova(manova_region, test = "Pillai")
+anova(manova_region, test = "Wilks")
+anova(manova_region, test = "Hotelling-Lawley")
+anova(manova_region, test = "Roy")
+```
+
+---
+
+## Step 6: Combined Multivariate and Univariate Output by Region
+
+```{r}
+# Type III MANOVA using car::Anova.
+region_anova_type3 <- car::Anova(manova_region, type = 3)
+
+# Multivariate results only.
+summary(region_anova_type3)
+
+# Multivariate and univariate results together.
+summary(region_anova_type3, univariate = TRUE)
+
+# Multivariate and univariate results with Holm p-value adjustment.
+summary(region_anova_type3, univariate = TRUE, p.adjust.method = "holm")
+```
+
+---
+
+## Step 7: Check Residuals for Multivariate Normality
+
+```{r}
+cqplot(residuals(manova_region),
+       main = "Residuals from Region MANOVA")
+```
+
+---
+
+## Step 8: Correct Pairwise Contrasts Between Specific Regions
+
+Important correction: with treatment contrasts, a coefficient such as `regionSul = 0` compares **Sul against the reference region**. Therefore, to test a specific pairwise comparison, we explicitly set the desired reference region before fitting the model.
+
+```{r}
+# Reset to treatment contrasts for direct pairwise interpretation.
+options(contrasts = c("contr.treatment", "contr.poly"))
+
+# -----------------------------
+# 8.1 Sul vs Norte
+# -----------------------------
+
+# Set Norte as reference.
+df_region_ref_norte <- df_region
+df_region_ref_norte$region <- relevel(factor(df_region_ref_norte$region), ref = "Norte")
+
+manova_region_ref_norte <- lm(
+  cbind(temp_mean, temp_min, temp_max,
+        humidity, precip, rainy_days, ndvi) ~ region,
+  data = df_region_ref_norte
+)
+
+# With Norte as reference, regionSul = 0 tests Sul vs Norte.
+contrast_sul_vs_norte <- car::linearHypothesis(
+  manova_region_ref_norte,
+  "regionSul = 0",
+  test = "Pillai"
+)
+contrast_sul_vs_norte
+
+# -----------------------------
+# 8.2 Nordeste vs Norte
+# -----------------------------
+
+# With Norte as reference, regionNordeste = 0 tests Nordeste vs Norte.
+contrast_nordeste_vs_norte <- car::linearHypothesis(
+  manova_region_ref_norte,
+  "regionNordeste = 0",
+  test = "Pillai"
+)
+contrast_nordeste_vs_norte
+
+# -----------------------------
+# 8.3 Sul vs Sudeste
+# -----------------------------
+
+# Set Sudeste as reference.
+df_region_ref_sudeste <- df_region
+df_region_ref_sudeste$region <- relevel(factor(df_region_ref_sudeste$region), ref = "Sudeste")
+
+manova_region_ref_sudeste <- lm(
+  cbind(temp_mean, temp_min, temp_max,
+        humidity, precip, rainy_days, ndvi) ~ region,
+  data = df_region_ref_sudeste
+)
+
+# With Sudeste as reference, regionSul = 0 tests Sul vs Sudeste.
+contrast_sul_vs_sudeste <- car::linearHypothesis(
+  manova_region_ref_sudeste,
+  "regionSul = 0",
+  test = "Pillai"
+)
+contrast_sul_vs_sudeste
+```
+
+---
+
+## Step 9: Univariate Follow-Up for Correct Region Contrasts
+
+The multivariate contrasts above test whether the full response-variable profile differs between two regions. The following code provides univariate follow-up tests for the same selected pairwise region comparisons.
+
+```{r}
+# Function for univariate two-group comparison for selected region pairs.
+region_pairwise_univariate <- function(data, region_a, region_b, response_vars) {
+  subdat <- data[data$region %in% c(region_a, region_b), ]
+  subdat$region <- factor(subdat$region, levels = c(region_a, region_b))
+  
+  out <- lapply(response_vars, function(v) {
+    fit <- lm(as.formula(paste(v, "~ region")), data = subdat)
+    a <- anova(fit)
+    data.frame(
+      comparison = paste(region_b, "vs", region_a),
+      response = v,
+      F_value = a$`F value`[1],
+      p_value = a$`Pr(>F)`[1]
+    )
+  })
+  
+  out <- do.call(rbind, out)
+  out$p_value_holm <- p.adjust(out$p_value, method = "holm")
+  out
+}
+
+univ_sul_vs_norte <- region_pairwise_univariate(
+  df_region,
+  region_a = "Norte",
+  region_b = "Sul",
+  response_vars = resp_vars_region
+)
+univ_sul_vs_norte
+
+univ_nordeste_vs_norte <- region_pairwise_univariate(
+  df_region,
+  region_a = "Norte",
+  region_b = "Nordeste",
+  response_vars = resp_vars_region
+)
+univ_nordeste_vs_norte
+
+univ_sul_vs_sudeste <- region_pairwise_univariate(
+  df_region,
+  region_a = "Sudeste",
+  region_b = "Sul",
+  response_vars = resp_vars_region
+)
+univ_sul_vs_sudeste
+```
+
+---
+
+## Step 10: MANOVA by GDP Group - Low / Medium / High
+
+We test whether selected climate and environmental variables differ among **Low**, **Medium**, and **High** GDP microregions. Unlike the earlier High-vs-Medium binary analysis, this section retains all three GDP groups. Low is used as the reference level for follow-up contrasts.
+
+```{r}
+# Keep all three GDP groups.
+df_gdp_all <- df_gdp[df_gdp$gdp_group %in% c("Low", "Medium", "High"), ]
+df_gdp_all$gdp_group <- factor(df_gdp_all$gdp_group,
+                               levels = c("Low", "Medium", "High"))
+
+# Confirm group sizes.
+table(df_gdp_all$gdp_group)
+levels(df_gdp_all$gdp_group)
+
+# Descriptive statistics by GDP group.
+gdp_group_means <- aggregate(df_gdp_all[, resp_vars_gdp],
+                             by = list(gdp_group = df_gdp_all$gdp_group),
+                             FUN = mean)
+gdp_group_means
+
+gdp_group_sds <- aggregate(df_gdp_all[, resp_vars_gdp],
+                           by = list(gdp_group = df_gdp_all$gdp_group),
+                           FUN = sd)
+gdp_group_sds
+```
+
+---
+
+## Step 11: Boxplots by GDP Group
+
+```{r}
+for (v in resp_vars_gdp) {
+  boxplot(df_gdp_all[[v]] ~ df_gdp_all$gdp_group,
+          col = "lightblue",
+          main = paste(v, "by GDP Group"),
+          xlab = "GDP Group",
+          ylab = v)
+  
+  means <- tapply(df_gdp_all[[v]], df_gdp_all$gdp_group, mean, na.rm = TRUE)
+  points(seq_along(means), means, col = "red", pch = 19, cex = 1.2)
+  
+  y_offset <- 0.04 * diff(range(df_gdp_all[[v]], na.rm = TRUE))
+  text(x = seq_along(means),
+       y = means + y_offset,
+       labels = round(means, 2),
+       cex = 0.8)
+}
+```
+
+---
+
+## Step 12: Check Multivariate Normality and Covariance Homogeneity by GDP Group
+
+```{r}
+for (i in seq_along(levels(df_gdp_all$gdp_group))) {
+  current_group <- levels(df_gdp_all$gdp_group)[i]
+  cqplot(df_gdp_all[df_gdp_all$gdp_group == current_group, resp_vars_gdp],
+         main = paste("MVN Check - GDP Group", current_group))
+}
+
+boxm_gdp_all <- try(
+  biotools::boxM(df_gdp_all[, resp_vars_gdp], grouping = df_gdp_all$gdp_group),
+  silent = TRUE
+)
+boxm_gdp_all
+```
+
+---
+
+## Step 13: Run MANOVA by GDP Group - Overall Low / Medium / High Effect
+
+```{r}
+# Use sum contrasts for Type III tests of the overall GDP-group effect.
+options(contrasts = c("contr.sum", "contr.poly"))
+
+manova_gdp_all <- lm(
+  cbind(temp_mean, humidity, precip, rainy_days, ndvi) ~ gdp_group,
+  data = df_gdp_all
+)
+
+# Univariate ANOVA results for each response variable.
+summary.aov(manova_gdp_all)
+
+# Multivariate tests.
+anova(manova_gdp_all, test = "Pillai")
+anova(manova_gdp_all, test = "Wilks")
+anova(manova_gdp_all, test = "Hotelling-Lawley")
+anova(manova_gdp_all, test = "Roy")
+
+# Type III MANOVA using car::Anova.
+gdp_all_anova_type3 <- car::Anova(manova_gdp_all, type = 3)
+summary(gdp_all_anova_type3)
+summary(gdp_all_anova_type3, univariate = TRUE)
+summary(gdp_all_anova_type3, univariate = TRUE, p.adjust.method = "holm")
+```
+
+---
+
+## Step 14: GDP Group Contrasts with Low as Reference
+
+This step directly addresses the target interpretation: **Medium vs Low** and **High vs Low**. With treatment contrasts and `Low` as the reference level:
+
+- `gdp_groupMedium = 0` tests `Medium vs Low`
+- `gdp_groupHigh = 0` tests `High vs Low`
+
+```{r}
+# Use treatment contrasts for direct Low-reference interpretation.
+options(contrasts = c("contr.treatment", "contr.poly"))
+
+df_gdp_ref_low <- df_gdp_all
+df_gdp_ref_low$gdp_group <- relevel(factor(df_gdp_ref_low$gdp_group), ref = "Low")
+
+# Confirm that Low is the reference category.
+levels(df_gdp_ref_low$gdp_group)
+contrasts(df_gdp_ref_low$gdp_group)
+
+manova_gdp_ref_low <- lm(
+  cbind(temp_mean, humidity, precip, rainy_days, ndvi) ~ gdp_group,
+  data = df_gdp_ref_low
+)
+
+# Medium vs Low multivariate contrast.
+contrast_medium_vs_low <- car::linearHypothesis(
+  manova_gdp_ref_low,
+  "gdp_groupMedium = 0",
+  test = "Pillai"
+)
+contrast_medium_vs_low
+
+# High vs Low multivariate contrast.
+contrast_high_vs_low <- car::linearHypothesis(
+  manova_gdp_ref_low,
+  "gdp_groupHigh = 0",
+  test = "Pillai"
+)
+contrast_high_vs_low
+
+# Joint test: Medium vs Low and High vs Low simultaneously.
+# This is equivalent to testing whether the GDP-group profile differs from Low for either non-Low group.
+contrast_medium_high_vs_low_joint <- car::linearHypothesis(
+  manova_gdp_ref_low,
+  c("gdp_groupMedium = 0", "gdp_groupHigh = 0"),
+  test = "Pillai"
+)
+contrast_medium_high_vs_low_joint
+```
+
+---
+
+## Step 15: Univariate Follow-Up for GDP Group Contrasts with Low as Reference
+
+The multivariate tests above evaluate the full response-variable profile. The table below gives univariate follow-up results for `Medium vs Low` and `High vs Low` for each response variable. Holm adjustment is applied across all follow-up p-values.
+
+```{r}
+gdp_low_ref_univariate <- lapply(resp_vars_gdp, function(v) {
+  fit <- lm(as.formula(paste(v, "~ gdp_group")), data = df_gdp_ref_low)
+  coef_tab <- summary(fit)$coefficients
+  
+  data.frame(
+    response = v,
+    comparison = c("Medium vs Low", "High vs Low"),
+    estimate_difference = c(coef_tab["gdp_groupMedium", "Estimate"],
+                            coef_tab["gdp_groupHigh", "Estimate"]),
+    std_error = c(coef_tab["gdp_groupMedium", "Std. Error"],
+                  coef_tab["gdp_groupHigh", "Std. Error"]),
+    t_value = c(coef_tab["gdp_groupMedium", "t value"],
+                coef_tab["gdp_groupHigh", "t value"]),
+    p_value = c(coef_tab["gdp_groupMedium", "Pr(>|t|)"],
+                coef_tab["gdp_groupHigh", "Pr(>|t|)"])
+  )
+})
+
+gdp_low_ref_univariate <- do.call(rbind, gdp_low_ref_univariate)
+gdp_low_ref_univariate$p_value_holm <- p.adjust(gdp_low_ref_univariate$p_value,
+                                                method = "holm")
+gdp_low_ref_univariate
+```
+
+---
+
+## Step 16: Check Residuals for GDP Group MANOVA
+
+```{r}
+cqplot(residuals(manova_gdp_all),
+       main = "Residuals from GDP Group MANOVA: Low / Medium / High")
+```
+
+---
+
+## Step 17: Final Summary
+
+```{r}
+cat("Region MANOVA response variables:", paste(resp_vars_region, collapse = ", "), "\n")
+cat("GDP-group MANOVA response variables:", paste(resp_vars_gdp, collapse = ", "), "\n")
+cat("GDP-group levels:", paste(levels(df_gdp_all$gdp_group), collapse = ", "), "\n")
+cat("GDP-group follow-up reference level: Low\n")
+cat("GDP-group follow-up contrasts: Medium vs Low; High vs Low\n")
+```
+
+---
+
+## Step 18: Restore Original Options
+
+```{r}
+# Restore original global options.
+options(old_options)
+```

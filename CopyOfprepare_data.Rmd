@@ -1,0 +1,382 @@
+---
+title: "prepare_data"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+options(width = 100)
+```
+
+## Prepare Brazil Microregion Data
+
+This script prepares the Brazil microregion dataset used by the downstream GLM, PCA, cluster analysis, and MANOVA workflows.
+
+The final objects saved are:
+
+- `df`: prepared analysis dataset
+- `num_vars`: numeric variables used in downstream analyses
+
+The output file is saved to:
+
+```text
+data/prepared_data.RData
+```
+
+```{r}
+library(dplyr)
+library(readr)
+library(tibble)
+library(rlang)
+```
+
+## Step 1: Define Paths
+
+```{r}
+# Raw CSV files are expected in the current project directory.
+# Change input_dir if your raw CSV files are stored elsewhere.
+input_dir <- "."
+
+# Downstream scripts load /cloud/project/data/prepared_data.RData,
+# so the relative output path should be data/prepared_data.RData.
+output_dir <- "data"
+output_file <- file.path(output_dir, "prepared_data.RData")
+
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Step 2: Helper Functions
+
+```{r}
+# Annual files: extract the 2019 column.
+read_annual <- function(file, varname, year = "2019") {
+  path <- file.path(input_dir, file)
+  
+  if (!file.exists(path)) {
+    stop("File not found: ", path)
+  }
+  
+  raw <- read_csv(path, show_col_types = FALSE)
+  
+  if (!year %in% names(raw)) {
+    stop("Column '", year, "' was not found in ", file)
+  }
+  
+  tibble(
+    microregion_code = as.integer(raw[[1]]),
+    !!varname := raw[[year]]
+  )
+}
+
+# Weekly files: extract weeks beginning with 2019 and compute row mean or row sum.
+read_weekly <- function(file, varname, year_prefix = "2019", use_sum = FALSE) {
+  path <- file.path(input_dir, file)
+  
+  if (!file.exists(path)) {
+    stop("File not found: ", path)
+  }
+  
+  raw <- read_csv(path, show_col_types = FALSE)
+  
+  # Important: use the standard ASCII caret '^' for start-of-string matching.
+  # This selects columns such as 201901, 201902, ..., 201952.
+  week_cols <- grep(paste0("^", year_prefix), names(raw), value = TRUE)
+  
+  if (length(week_cols) == 0) {
+    stop("No weekly columns beginning with '", year_prefix, "' were found in ", file)
+  }
+  
+  x <- as.matrix(raw[, week_cols])
+  values <- if (use_sum) {
+    rowSums(x, na.rm = TRUE)
+  } else {
+    rowMeans(x, na.rm = TRUE)
+  }
+  
+  tibble(
+    microregion_code = as.integer(raw[[1]]),
+    !!varname := values
+  )
+}
+
+# Monthly file: for PDSI, extract 2019 month columns and compute row mean.
+read_pdsi <- function(file, varname, month_pattern = "-19$") {
+  path <- file.path(input_dir, file)
+  
+  if (!file.exists(path)) {
+    stop("File not found: ", path)
+  }
+  
+  raw <- read_csv(path, show_col_types = FALSE)
+  month_cols <- grep(month_pattern, names(raw), value = TRUE)
+  
+  if (length(month_cols) == 0) {
+    stop("No monthly columns matching '", month_pattern, "' were found in ", file)
+  }
+  
+  x <- as.matrix(raw[, month_cols])
+  values <- rowMeans(x, na.rm = TRUE)
+  
+  tibble(
+    microregion_code = as.integer(raw[[1]]),
+    !!varname := values
+  )
+}
+
+# Regional median imputation for numeric variables.
+impute_regional_median <- function(x) {
+  med <- median(x, na.rm = TRUE)
+  
+  if (is.na(med)) {
+    return(x)
+  }
+  
+  ifelse(is.na(x), med, x)
+}
+
+# Winsorize a numeric vector at Q1 - k*IQR and Q3 + k*IQR.
+winsorize_iqr <- function(x, k = 3) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lo <- q1 - k * iqr
+  hi <- q3 + k * iqr
+  pmax(pmin(x, hi), lo)
+}
+```
+
+## Step 3: Load and Merge Source Files
+
+```{r}
+df <- list(
+  read_annual("/cloud/project/data/Building_surface_area.csv", "building_area"),
+  read_annual("/cloud/project/data/Gross_Domestic_Product.csv", "gdp"),
+  read_weekly("/cloud/project/data/Mean_temperature.csv", "temp_mean"),
+  read_weekly("/cloud/project/data/Minimum_temperature.csv", "temp_min"),
+  read_weekly("/cloud/project/data/Maximum_temperature.csv", "temp_max"),
+  read_weekly("/cloud/project/data/Mean_relative_humidity.csv", "humidity"),
+  read_weekly("/cloud/project/data/Mean_atmospheric_pressure.csv", "pressure"),
+  read_weekly("/cloud/project/data/Mean_wind_speed.csv", "wind_speed"),
+  read_weekly("/cloud/project/data/Mean_Normalized_Difference_Vegetation_Index.csv", "ndvi"),
+  read_weekly("/cloud/project/data/Sum_precipitation.csv", "precip", use_sum = TRUE),
+  read_weekly("/cloud/project/data/Number_of_rainy_days.csv", "rainy_days", use_sum = TRUE),
+  read_pdsi("/cloud/project/data/Palmer_Drought_Severity_Index.csv", "pdsi")
+) %>%
+  Reduce(function(x, y) inner_join(x, y, by = "microregion_code"), .)
+
+dim(df)
+head(df)
+```
+
+## Step 4: Add Region and Climate Variables
+
+```{r}
+state_to_region <- c(
+  "11" = "Norte", "12" = "Norte", "13" = "Norte", "14" = "Norte",
+  "15" = "Norte", "16" = "Norte", "17" = "Norte",
+  "21" = "Nordeste", "22" = "Nordeste", "23" = "Nordeste",
+  "24" = "Nordeste", "25" = "Nordeste", "26" = "Nordeste",
+  "27" = "Nordeste", "28" = "Nordeste", "29" = "Nordeste",
+  "31" = "Sudeste", "32" = "Sudeste", "33" = "Sudeste", "35" = "Sudeste",
+  "41" = "Sul", "42" = "Sul", "43" = "Sul",
+  "50" = "Centro-Oeste", "51" = "Centro-Oeste",
+  "52" = "Centro-Oeste", "53" = "Centro-Oeste"
+)
+
+region_levels <- c("Centro-Oeste", "Nordeste", "Norte", "Sudeste", "Sul")
+climate_levels <- c(
+  "Tropical", "Semi-arid", "Tropical_Savanna", "Subtropical", "Temperate"
+)
+
+df <- df %>%
+  mutate(
+    state_code = microregion_code %/% 1000L,
+    region = state_to_region[as.character(state_code)]
+  )
+
+if (any(is.na(df$region))) {
+  missing_states <- sort(unique(df$state_code[is.na(df$region)]))
+  stop("Some state codes were not mapped to regions: ", paste(missing_states, collapse = ", "))
+}
+
+df <- df %>%
+  mutate(
+    region = factor(region, levels = region_levels),
+    climate_zone = case_when(
+      region == "Norte" ~ "Tropical",
+      region == "Nordeste" ~ "Semi-arid",
+      region == "Centro-Oeste" ~ "Tropical_Savanna",
+      region == "Sudeste" ~ "Subtropical",
+      region == "Sul" ~ "Temperate",
+      TRUE ~ NA_character_
+    ),
+    climate_zone = factor(climate_zone, levels = climate_levels)
+  )
+
+table(df$region)
+table(df$climate_zone)
+```
+
+## Step 5: Define Numeric Variables
+
+```{r}
+num_vars <- c(
+  "building_area", "gdp", "temp_mean", "temp_min", "temp_max",
+  "humidity", "pressure", "wind_speed", "ndvi", "pdsi",
+  "precip", "rainy_days"
+)
+
+missing_num_vars <- setdiff(num_vars, names(df))
+
+if (length(missing_num_vars) > 0) {
+  stop("The following numeric variables are missing: ", paste(missing_num_vars, collapse = ", "))
+}
+
+num_vars
+```
+
+## Step 6: Missing Values - Regional Median Imputation
+
+```{r}
+missing_before <- sum(is.na(df[, num_vars]))
+cat("Missing numeric values before imputation:", missing_before, "\n")
+
+df <- df %>%
+  group_by(region) %>%
+  mutate(across(all_of(num_vars), impute_regional_median)) %>%
+  ungroup()
+
+missing_after <- sum(is.na(df[, num_vars]))
+cat("Missing numeric values after regional median imputation:", missing_after, "\n")
+```
+
+## Step 7: Create GDP Group
+
+```{r}
+# GDP groups are formed from the imputed GDP distribution before winsorization.
+# This preserves the original tertile-based economic grouping while still allowing
+# the continuous GDP variable to be winsorized for downstream numeric analyses.
+gdp_breaks <- quantile(
+  df$gdp,
+  probs = c(0, 1/3, 2/3, 1),
+  na.rm = TRUE
+)
+
+if (length(unique(gdp_breaks)) < length(gdp_breaks)) {
+  stop("GDP quantile breaks are not unique; GDP grouping cannot be created safely.")
+}
+
+df <- df %>%
+  mutate(
+    gdp_group = cut(
+      gdp,
+      breaks = gdp_breaks,
+      labels = c("Low", "Medium", "High"),
+      include.lowest = TRUE
+    ),
+    gdp_group = factor(gdp_group, levels = c("Low", "Medium", "High"))
+  )
+
+table(df$gdp_group)
+gdp_breaks
+```
+
+## Step 8: Outliers - Winsorize Continuous Variables at 3 x IQR
+
+```{r}
+# Winsorization is applied to numeric variables after imputation and after defining
+# the GDP tertile groups.
+for (col in num_vars) {
+  df[[col]] <- winsorize_iqr(df[[col]], k = 3)
+}
+```
+
+## Step 9: Final Checks and Summary
+
+```{r}
+cat("Dataset ready:", nrow(df), "rows x", ncol(df), "columns\n")
+cat("Categorical variables: region, climate_zone, gdp_group\n")
+cat("Continuous variables:\n")
+print(num_vars)
+cat("Total missing values in final df:", sum(is.na(df)), "\n")
+
+if (nrow(df) != 558) {
+  warning("Expected 558 microregions, but final df has ", nrow(df), " rows.")
+}
+
+if (any(is.na(df$gdp_group))) {
+  warning("gdp_group contains missing values.")
+}
+
+if (!all(table(df$gdp_group) == 186)) {
+  warning("GDP groups are not exactly balanced at 186 observations per group.")
+}
+
+summary(df[, c("region", "climate_zone", "gdp_group", num_vars)])
+```
+
+## Step 10: Save Prepared Data
+
+```{r}
+save(df, num_vars, file = output_file)
+cat("Saved prepared data to:", normalizePath(output_file), "\n")
+```
+
+```{r}
+library(tidyverse)
+
+# Replace df2019 with the name of your prepared 2019 analytic dataset
+df <- df2019
+
+# Continuous variables used for descriptive distribution checks
+continuous_vars <- c(
+  "building_area", "gdp",
+  "temp_mean", "temp_min", "temp_max",
+  "humidity", "pressure", "wind_speed",
+  "ndvi", "pdsi", "precip", "rainy_days"
+)
+
+# Check that all variable names exist in the dataset
+missing_vars <- setdiff(continuous_vars, names(df))
+if (length(missing_vars) > 0) {
+  stop("These variables are missing from df: ", paste(missing_vars, collapse = ", "))
+}
+
+# Long format for faceted plots
+df_long <- df %>%
+  select(all_of(continuous_vars)) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  filter(!is.na(value))
+
+# Mean and median lines for each variable
+summary_lines <- df_long %>%
+  group_by(variable) %>%
+  summarise(
+    mean_value = mean(value, na.rm = TRUE),
+    median_value = median(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(mean_value, median_value),
+    names_to = "statistic",
+    values_to = "xintercept"
+  ) %>%
+  mutate(
+    statistic = recode(
+      statistic,
+      mean_value = "Mean",
+      median_value = "Median"
+    )
+  )
+```
+
